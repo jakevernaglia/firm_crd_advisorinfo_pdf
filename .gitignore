@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# Virtual environment
+.venv/
+
+# Downloads and outputs
+downloads_tmp/
+firm_pdfs/
+
+# OS files
+.DS_Store
+Thumbs.db
