@@ -40,6 +40,7 @@ BASE_DIR = Path(__file__).resolve().parent
 FIRM_PDFS_DIR = BASE_DIR / "Firm_PDFs"
 TMP_DOWNLOADS_DIR = BASE_DIR / "downloads_tmp"
 PROCESSED_FILE = BASE_DIR / "processed_crds.txt"
+SKIPPED_FILE = BASE_DIR / "skipped_crds.txt"
 
 
 def log(message: str) -> None:
@@ -117,18 +118,36 @@ def append_processed(crd: str) -> None:
 		f.write(crd + "\n")
 
 
+def load_skipped() -> set[str]:
+	if not SKIPPED_FILE.exists():
+		return set()
+	with open(SKIPPED_FILE, "r", encoding="utf-8") as f:
+		return set(line.strip() for line in f if line.strip())
+
+
+def append_skipped(crd: str) -> None:
+	log(f"skip crd: {crd}")
+	with open(SKIPPED_FILE, "a", encoding="utf-8") as f:
+		f.write(crd + "\n")
+
+
 def find_element_retry(driver: webdriver.Chrome, xpath: str):
+	start_ts = time.time()
 	while True:
 		try:
 			el = driver.find_element(By.XPATH, xpath)
 			return el
 		except Exception as e:
 			log(f"wait element xpath={xpath[:80]}... {describe_driver(driver)}")
+			# watchdog: abort after ~35s so caller can recover/skip
+			if time.time() - start_ts > 35:
+				raise TimeoutError(f"timeout waiting for element: {xpath}")
 			random_delay(0.2, 0.5)
 			random_scroll(driver)
 
 
 def click_xpath_retry(driver: webdriver.Chrome, xpath: str) -> None:
+	start_ts = time.time()
 	while True:
 		el = find_element_retry(driver, xpath)
 		try:
@@ -147,6 +166,9 @@ def click_xpath_retry(driver: webdriver.Chrome, xpath: str) -> None:
 					log(f"enter fallback xpath={xpath[:80]}... {describe_driver(driver)}")
 					return
 				except Exception:
+					# watchdog: abort after ~45s so caller can recover/skip
+					if time.time() - start_ts > 45:
+						raise TimeoutError(f"timeout clicking element: {xpath}")
 					random_delay(0.25, 0.8)
 					random_scroll(driver)
 
@@ -204,11 +226,16 @@ def wait_for_outcome_after_click(driver: webdriver.Chrome, existing_handles: lis
 	# Returns one of: 'new_tab', 'viewer_same', 'download'
 	last_seen_handles = existing_handles[:]
 	while True:
+		# 1) Direct download first: if a file appeared after the click, handle it immediately
+		cand = newest_file_in_directory(TMP_DOWNLOADS_DIR)
+		if cand and cand.stat().st_mtime >= since_time:
+			log(f"detected direct download: {cand.name}")
+			return 'download'
+		# 2) New tab?
 		try:
 			handles = driver.window_handles
 		except Exception:
 			handles = []
-		# New tab appeared
 		if len(handles) > len(last_seen_handles):
 			new_handles = [h for h in handles if h not in last_seen_handles]
 			if new_handles:
@@ -217,26 +244,22 @@ def wait_for_outcome_after_click(driver: webdriver.Chrome, existing_handles: lis
 					log(f"switched to new tab: {describe_driver(driver)}")
 					return 'new_tab'
 				except NoSuchWindowException:
-					# Tab closed quickly; check for a download and continue loop
-					cand = newest_file_in_directory(TMP_DOWNLOADS_DIR)
-					if cand and cand.stat().st_mtime >= since_time:
-						log(f"new tab closed; detected direct download: {cand.name}")
+					# Tab closed quickly; treat as direct download if file exists
+					cand2 = newest_file_in_directory(TMP_DOWNLOADS_DIR)
+					if cand2 and cand2.stat().st_mtime >= since_time:
+						log(f"new tab closed; detected direct download: {cand2.name}")
 						return 'download'
-					# Else continue to wait
+					# Otherwise continue waiting
 					pass
 			last_seen_handles = handles
-		# Same-tab viewer?
+		# 3) Same-tab viewer?
 		try:
 			if extract_pdf_embed_src(driver) or "crd_iapd_Brochure.aspx" in (driver.current_url or ""):
 				log("detected same-tab PDF viewer")
 				return 'viewer_same'
 		except Exception:
 			pass
-		# Direct download?
-		cand = newest_file_in_directory(TMP_DOWNLOADS_DIR)
-		if cand and cand.stat().st_mtime >= since_time:
-			log(f"detected direct download: {cand.name}")
-			return 'download'
+		# loop
 		random_delay(0.2, 0.6)
 
 
@@ -912,6 +935,8 @@ def verify_or_fallback(driver: webdriver.Chrome, crd: str, since_time: float) ->
 def move_finalize_verify(crd: str, start_time: float) -> None:
 	dest = FIRM_PDFS_DIR / f"{crd}.pdf"
 	finalize_download(crd, start_time)
+	# short cooldown to avoid race with next CRD picking this file as 'newest'
+	random_delay(0.4, 0.8)
 	if verify_needed_ref[0]:
 		ok = verify_or_fallback(driver_ref[0], crd, start_time)
 		if not ok:
@@ -1013,14 +1038,15 @@ def main() -> None:
 
 	all_crds = get_all_crds(CSV_FILENAME)
 	processed = load_processed()
+	skipped = load_skipped()
 	log(f"loaded {len(all_crds)} CRDs, {len(processed)} already processed")
 	targets: list[str] = []
 	for crd in all_crds:
 		dest = FIRM_PDFS_DIR / f"{crd}.pdf"
-		if crd in processed or dest.exists():
+		if crd in processed or crd in skipped or dest.exists():
 			continue
 		targets.append(crd)
-		if len(targets) >= 10:
+		if len(targets) >= 20:
 			break
 	log(f"processing next {len(targets)} CRDs: {targets}")
 
@@ -1037,7 +1063,11 @@ def main() -> None:
 			log(f"=== DONE CRD {crd} ===")
 			random_idle(0.8, 1.8)
 		except Exception as e:
-			log(f"CRD {crd} failed with error: {e}; restarting driver and continuing")
+			log(f"CRD {crd} failed with error: {e}; skipping and restarting driver")
+			try:
+				append_skipped(crd)
+			except Exception:
+				pass
 			try:
 				driver.quit()
 			except Exception:
